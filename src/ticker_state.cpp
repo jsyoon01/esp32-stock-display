@@ -232,7 +232,9 @@ bool ensureCandlesFresh(TickerState& ts, const struct tm& nowLocal, bool session
   ts.sessionBasisOpen = sessionOpen;
 
   // Ensure we have the previous regular session close for % change.
-  if (ts.candleDayKey != 0) {
+  // NOTE: In the new budgeted scheduler, `/quote` provides `previous_close`, so avoid extra
+  // `/time_series` prev-close lookups unless we truly don't have prevClose yet.
+  if (ts.candleDayKey != 0 && ts.prevClose <= 0.0f) {
     uint32_t prevSessionCandidate = previousWeekdayDayKey(ts.candleDayKey);
     if (ts.prevCloseDayKey != prevSessionCandidate || ts.prevClose <= 0.0f) {
       if (twelvedataCanRequestNow()) {
@@ -241,8 +243,8 @@ bool ensureCandlesFresh(TickerState& ts, const struct tm& nowLocal, bool session
     }
   }
 
-  updateDerivedFromCandles(ts);
   updateDisplayedPrice(ts);
+  updateDerivedFromCandles(ts);
 
   // #region agent log
   if (ts.symbol && strcmp(ts.symbol, "AAPL") == 0) {

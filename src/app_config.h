@@ -37,9 +37,13 @@ static const char* TWELVEDATA_API_KEY = "";
 
 // API throttling (free tier is tight)
 #define HTTP_TIMEOUT_MS 10000
-#define API_MIN_SPACING_MS 10000
 
-// Display dwell (only switch once next ticker is ready)
+// Market-hours scheduler cadence:
+// We refresh one ticker per tick with a /quote + /time_series pair (2 credits).
+// With 10 tickers and 390 market minutes, 60s keeps us under ~800 credits/day.
+#define PAIR_TICK_MS 60000UL
+
+// Display dwell (always rotate; data may be stale/loading until refreshed)
 #define MIN_DISPLAY_MS 15000
 
 // Closed-market session lookup (holidays/weekends): max prior weekday dates to probe

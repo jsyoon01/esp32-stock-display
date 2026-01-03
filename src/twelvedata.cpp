@@ -12,6 +12,12 @@
 static unsigned long nextApiAllowedAtMs = 0;
 static bool lastSpacedThrottled = false;
 
+// Rolling per-minute cap for free tier (we keep the historical 8/min guard).
+static const uint8_t MAX_REQ_PER_MIN = 8;
+static unsigned long reqTimesMs[MAX_REQ_PER_MIN];
+static uint8_t reqCount = 0;
+static uint8_t reqPos = 0; // points to the oldest entry when buffer is full
+
 bool twelvedataCanRequestNow() {
   return millis() >= nextApiAllowedAtMs;
 }
@@ -80,9 +86,29 @@ static bool httpGetStringSpaced(const String& url, String& outPayload) {
     return false;
   }
   lastSpacedThrottled = false;
+
+  // Rolling 8/min guard. This replaces the old fixed spacing so we can do
+  // back-to-back quote+time_series calls while staying under the per-minute cap.
+  if (reqCount >= MAX_REQ_PER_MIN) {
+    unsigned long oldest = reqTimesMs[reqPos];
+    if ((now - oldest) < 60000UL) {
+      nextApiAllowedAtMs = oldest + 60000UL;
+      lastSpacedThrottled = true;
+      // #region agent log
+      agentLogJson("H2", "twelvedata.cpp:httpGetStringSpaced", "throttled", "", 0,
+                   (uint32_t)now, (uint32_t)nextApiAllowedAtMs, 0.0f, 0.0f);
+      // #endregion
+      return false;
+    }
+    // Window advanced; overwrite oldest.
+  }
+
+  // Mark this request in the rolling window (counts even if it fails).
+  reqTimesMs[reqPos] = now;
+  reqPos = (uint8_t)((reqPos + 1) % MAX_REQ_PER_MIN);
+  if (reqCount < MAX_REQ_PER_MIN) reqCount++;
+
   bool ok = httpGetString(url, outPayload);
-  unsigned long after = millis() + API_MIN_SPACING_MS;
-  if (nextApiAllowedAtMs < after) nextApiAllowedAtMs = after;
   return ok;
 }
 
@@ -452,7 +478,9 @@ bool fetchQuote(TickerState& ts) {
                  ts.symbol, 200, (uint32_t)code, 0, 0.0f, 0.0f);
     // #endregion
     Serial.printf("TD quote error (code=%d): %s\n", code, msg);
-    if (code == 429) nextApiAllowedAtMs = millis() + 60000;
+    if (code == 429) {
+      nextApiAllowedAtMs = millis() + 60000;
+    }
     return false;
   }
 

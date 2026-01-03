@@ -6,5 +6,3 @@
 
 void displaySplash(MatrixPanel_I2S_DMA* display, const char* line1, const char* line2);
 void displayActive(MatrixPanel_I2S_DMA* display, const TickerState& ts);
-
-

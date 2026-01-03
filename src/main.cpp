@@ -19,7 +19,9 @@ static TickerState tickers[MAX_TICKERS];
 static TickerManager tickerManager;
 static uint8_t activeTickerIdx = 0;
 static unsigned long activeSinceMs = 0;
-static uint8_t prefetchTickerIdx = 0;
+static uint8_t rrTickerIdx = 0;
+static unsigned long nextPairAtMs = 0;
+static bool wasSessionOpen = false;
 
 static uint8_t nextTickerIndex(uint8_t idx) {
   uint8_t n = tickerManager.count();
@@ -94,13 +96,51 @@ static void applyTickersFromManager() {
   }
 
   activeTickerIdx = 0;
-  prefetchTickerIdx = nextTickerIndex(activeTickerIdx);
   activeSinceMs = millis();
+  rrTickerIdx = 0;
+  nextPairAtMs = 0;
+  wasSessionOpen = false;
+}
+
+static void preloadTickerBlocking(TickerState& ts, const struct tm& nowLocal) {
+  if (!ts.symbol || ts.symbol[0] == '\0') return;
+
+  bool quoteOk = false;
+  bool candlesOk = false;
+  unsigned long lastUiMs = 0;
+
+  while (!(quoteOk && candlesOk)) {
+    WebConfig::tick();
+    unsigned long nowMs = millis();
+
+    if (!quoteOk && twelvedataCanRequestNow()) {
+      quoteOk = ensureQuoteFresh(ts, nowLocal, false);
+    }
+    if (!candlesOk && twelvedataCanRequestNow()) {
+      candlesOk = ensureCandlesFresh(ts, nowLocal, false);
+    }
+
+    if (quoteOk && candlesOk) break;
+
+    // If throttled, wait near the next allowed window; otherwise short sleep.
+    unsigned long nextAllowed = twelvedataNextAllowedAtMs();
+    if (nextAllowed > nowMs) {
+      unsigned long waitMs = nextAllowed - nowMs;
+      if (waitMs > 2000UL) waitMs = 2000UL;
+      delay(waitMs);
+    } else {
+      delay(50);
+    }
+
+    displaySplash(dma_display, "Loading data", ts.symbol);
+  }
 }
 
 static void onTickersChanged() {
   applyTickersFromManager();
-  if (dma_display) displayActive(dma_display, tickers[activeTickerIdx]);
+  if (dma_display) {
+    displayActive(dma_display, tickers[activeTickerIdx]);
+  }
 }
 
 void setup() {
@@ -109,11 +149,53 @@ void setup() {
   TickerPersistence::loadOrDefaults(tickerManager);
   applyTickersFromManager();
 
+  // Init display early so we can show WiFi progress/failures (useful when Serial isn't watched).
+  HUB75_I2S_CFG mxconfig(64, 32, 1, _pins);
+  mxconfig.clkphase = false;
+
+  dma_display = new MatrixPanel_I2S_DMA(mxconfig);
+  dma_display->begin();
+  dma_display->setPanelBrightness(10);
+  dma_display->clearScreen();
+  Serial.println("Display initialized");
+
+  displaySplash(dma_display, "Connecting WiFi", WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long wifiStart = millis();
+  unsigned long lastUiMs = 0;
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+    delay(250);
     Serial.print(".");
+
+    // Update the matrix every ~1s so the user sees we are alive.
+    unsigned long now = millis();
+    if (now - lastUiMs >= 1000) {
+      lastUiMs = now;
+      displaySplash(dma_display, "Connecting WiFi", WIFI_SSID);
+    }
+
+    // Timeout with diagnostics.
+    if (now - wifiStart > 30000UL) {
+      Serial.println("\nWiFi connect timeout");
+      Serial.print("WiFi.status=");
+      Serial.println((int)WiFi.status());
+      displaySplash(dma_display, "WiFi failed", "Check SSID/PW");
+
+      // Keep retrying forever, but with a clearer cadence.
+      delay(2000);
+      Serial.println("Retrying WiFi...");
+      displaySplash(dma_display, "Retrying WiFi", WIFI_SSID);
+      WiFi.disconnect(true, true);
+      delay(250);
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      // reset timeout window
+      wifiStart = millis();
+    }
   }
+
   Serial.println("\nWiFi connected");
   Serial.print("IP: ");
   Serial.println(WiFi.localIP());
@@ -126,15 +208,6 @@ void setup() {
   } else {
     Serial.println("mDNS: failed to start");
   }
-
-  HUB75_I2S_CFG mxconfig(64, 32, 1, _pins);
-  mxconfig.clkphase = false;
-
-  dma_display = new MatrixPanel_I2S_DMA(mxconfig);
-  dma_display->begin();
-  dma_display->setPanelBrightness(10);
-  dma_display->clearScreen();
-  Serial.println("Display initialized");
 
   WebConfig::begin(tickerManager, onTickersChanged);
 
@@ -152,17 +225,32 @@ void setup() {
   }
 
   activeTickerIdx = 0;
-  prefetchTickerIdx = nextTickerIndex(activeTickerIdx);
 
   struct tm nowLocal;
   (void)getLocalTime(&nowLocal, 1000);
   bool sessionOpen = isRegularSessionOpenTm(nowLocal);
 
-  displaySplash(dma_display, "Fetching data", tickers[activeTickerIdx].symbol);
-  // Don't try to run multiple API calls back-to-back here; the loop will schedule one call per spacing window.
-  (void)ensureQuoteFresh(tickers[activeTickerIdx], nowLocal, sessionOpen);
-  displayActive(dma_display, tickers[activeTickerIdx]);
-  activeSinceMs = millis();
+  uint8_t n = tickerManager.count();
+
+  // If we boot outside session, backfill previous regular session data for all tickers once,
+  // then stay quiet until the market opens.
+  if (!sessionOpen) {
+    if (dma_display) {
+      displaySplash(dma_display, "Loading data", tickers[activeTickerIdx].symbol);
+    }
+
+    for (uint8_t i = 0; i < n; i++) {
+      if (!tickers[i].symbol || tickers[i].symbol[0] == '\0') continue;
+      preloadTickerBlocking(tickers[i], nowLocal);
+      Serial.print("Preloaded ticker: ");
+      Serial.println(tickers[i].symbol);
+    }
+    activeSinceMs = millis();
+  } else {
+    // Show something immediately after time sync.
+    displayActive(dma_display, tickers[activeTickerIdx]);
+    activeSinceMs = millis();
+  }
 }
 
 void loop() {
@@ -182,88 +270,49 @@ void loop() {
     return;
   }
 
-  // Scheduler: run at most ONE API-related operation per spacing window.
-  // This avoids immediately attempting quote+time_series back-to-back (which will always throttle the 2nd call).
-  if (twelvedataCanRequestNow()) {
-    bool did = false;
-
-    // Priority 1: prefetch should have quote first (for correct % using official previous_close),
-    // then candles (for the graph). Only one operation per spacing window.
-    if (!tickers[prefetchTickerIdx].hasQuote) {
-      // #region agent log
-      Serial.printf("{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H5\","
-                    "\"location\":\"main.cpp:loop\",\"message\":\"do_prefetch_quote\","
-                    "\"timestamp\":%lu,\"data\":{\"active\":\"%s\",\"prefetch\":\"%s\"}}\n",
-                    (unsigned long)millis(), tickers[activeTickerIdx].symbol, tickers[prefetchTickerIdx].symbol);
-      // #endregion
-      did = ensureQuoteFresh(tickers[prefetchTickerIdx], nowLocal, sessionOpen);
-    } else if (!tickers[prefetchTickerIdx].hasBackfill) {
-      // #region agent log
-      Serial.printf("{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H4\","
-                    "\"location\":\"main.cpp:loop\",\"message\":\"do_prefetch_candles\","
-                    "\"timestamp\":%lu,\"data\":{\"active\":\"%s\",\"prefetch\":\"%s\"}}\n",
-                    (unsigned long)millis(), tickers[activeTickerIdx].symbol, tickers[prefetchTickerIdx].symbol);
-      // #endregion
-      did = ensureCandlesFresh(tickers[prefetchTickerIdx], nowLocal, sessionOpen);
+  // Market-hours-only fetch: one ticker per minute, quote+time_series back-to-back.
+  if (sessionOpen) {
+    if (!wasSessionOpen) {
+      wasSessionOpen = true;
+      rrTickerIdx = activeTickerIdx;
+      nextPairAtMs = 0; // run immediately
     }
 
-    // Priority 2: keep active quote reasonably fresh during session (official prev close + last).
-    if (!did) {
-      unsigned long age = tickers[activeTickerIdx].hasQuote ? (nowMs - tickers[activeTickerIdx].lastQuoteFetchMs) : 0;
-      if (!tickers[activeTickerIdx].hasQuote || (sessionOpen && age > QUOTE_FRESHNESS_MS)) {
-        // #region agent log
-        Serial.printf("{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H2\","
-                      "\"location\":\"main.cpp:loop\",\"message\":\"do_active_quote\","
-                      "\"timestamp\":%lu,\"data\":{\"active\":\"%s\",\"ageMs\":%lu,\"sessionOpen\":%d}}\n",
-                      (unsigned long)millis(), tickers[activeTickerIdx].symbol, (unsigned long)age, (int)sessionOpen);
-        // #endregion
-        did = ensureQuoteFresh(tickers[activeTickerIdx], nowLocal, sessionOpen);
+    if (nowMs >= nextPairAtMs) {
+      uint8_t idx = rrTickerIdx;
+      if (idx >= n) idx = 0;
+
+      // Best-effort pair. Each call is still subject to the rolling 8/min limiter.
+      //
+      // Important: if we hit throttling (local limiter or 429 backoff), do NOT advance the
+      // round-robin index; instead retry this same ticker as soon as we're allowed again.
+      bool quoteOk = ensureQuoteFresh(tickers[idx], nowLocal, true);
+      if (!quoteOk && twelvedataNextAllowedAtMs() > nowMs) {
+        nextPairAtMs = twelvedataNextAllowedAtMs();
+        delay(20);
+        return;
       }
-    }
 
-    // Priority 3: keep active candles fresh-ish during session for graph.
-    if (!did) {
-      unsigned long cage = tickers[activeTickerIdx].lastCandleFetchMs ? (nowMs - tickers[activeTickerIdx].lastCandleFetchMs) : 0;
-      if (!tickers[activeTickerIdx].hasBackfill || (sessionOpen && cage > CANDLE_FRESHNESS_MS)) {
-        // #region agent log
-        Serial.printf("{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H2\","
-                      "\"location\":\"main.cpp:loop\",\"message\":\"do_active_candles\","
-                      "\"timestamp\":%lu,\"data\":{\"active\":\"%s\",\"ageMs\":%lu,\"sessionOpen\":%d}}\n",
-                      (unsigned long)millis(), tickers[activeTickerIdx].symbol, (unsigned long)cage, (int)sessionOpen);
-        // #endregion
-        did = ensureCandlesFresh(tickers[activeTickerIdx], nowLocal, sessionOpen);
+      bool candlesOk = ensureCandlesFresh(tickers[idx], nowLocal, true);
+      if (!candlesOk && twelvedataNextAllowedAtMs() > nowMs) {
+        nextPairAtMs = twelvedataNextAllowedAtMs();
+        delay(20);
+        return;
       }
-    }
 
-    // Priority 4: prefetch quote (so header is live immediately on switch).
-    if (!did) {
-      unsigned long page = tickers[prefetchTickerIdx].hasQuote ? (nowMs - tickers[prefetchTickerIdx].lastQuoteFetchMs) : 0;
-      if (!tickers[prefetchTickerIdx].hasQuote || (sessionOpen && page > QUOTE_FRESHNESS_MS)) {
-        // #region agent log
-        Serial.printf("{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H2\","
-                      "\"location\":\"main.cpp:loop\",\"message\":\"do_prefetch_quote\","
-                      "\"timestamp\":%lu,\"data\":{\"prefetch\":\"%s\",\"ageMs\":%lu,\"sessionOpen\":%d}}\n",
-                      (unsigned long)millis(), tickers[prefetchTickerIdx].symbol, (unsigned long)page, (int)sessionOpen);
-        // #endregion
-        did = ensureQuoteFresh(tickers[prefetchTickerIdx], nowLocal, sessionOpen);
-      }
+      rrTickerIdx = nextTickerIndex(idx);
+      nextPairAtMs = nowMs + PAIR_TICK_MS;
     }
+  } else {
+    wasSessionOpen = false;
   }
 
+  // Always rotate tickers based on dwell; do not stall waiting for prefetch readiness.
   if ((nowMs - activeSinceMs) >= MIN_DISPLAY_MS) {
-    const TickerState& nextTs = tickers[prefetchTickerIdx];
-    uint32_t basisDayKey = sessionOpen ? dayKeyFromTm(nowLocal) : closedSessionCandidateDayKeyFromTm(nowLocal);
-    bool basisOk = nextTs.hasBackfill && nextTs.sessionBasisOpen == sessionOpen && nextTs.sessionBasisDayKey == basisDayKey;
-    bool freshOk = (!sessionOpen) || ((nowMs - nextTs.lastCandleFetchMs) <= CANDLE_FRESHNESS_MS);
-    if (basisOk && freshOk) {
-      activeTickerIdx = prefetchTickerIdx;
-      activeSinceMs = nowMs;
-      prefetchTickerIdx = nextTickerIndex(activeTickerIdx);
-      displayActive(dma_display, tickers[activeTickerIdx]);
-    }
+    activeTickerIdx = nextTickerIndex(activeTickerIdx);
+    activeSinceMs = nowMs;
+    displayActive(dma_display, tickers[activeTickerIdx]);
   }
 
   delay(20);
 }
-
-

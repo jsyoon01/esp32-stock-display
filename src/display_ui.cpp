@@ -162,15 +162,49 @@ void displayActive(MatrixPanel_I2S_DMA* display, const TickerState& ts) {
 
 void displaySplash(MatrixPanel_I2S_DMA* display, const char* line1, const char* line2) {
   display->clearScreen();
-  display->setFont(nullptr);
   display->setTextSize(1);
   display->setTextWrap(false);
+
+  // Use the small TomThumb font so common strings (SSID/IP) fit on 64px panels.
+  display->setFont(&TomThumb);
+
+  auto printFit = [&](int16_t x, int16_t baselineY, uint16_t maxW, const char* s) {
+    String t = s ? String(s) : String("");
+
+    int16_t x1 = 0, y1 = 0;
+    uint16_t w = 0, h = 0;
+    display->getTextBounds(t.c_str(), x, baselineY, &x1, &y1, &w, &h);
+    if (w <= maxW) {
+      display->setCursor(x, baselineY);
+      display->print(t);
+      return;
+    }
+
+    // Truncate with ".." until it fits.
+    if (t.length() < 1) return;
+    while (t.length() > 1) {
+      String candidate = t.substring(0, t.length() - 1);
+      if (candidate.length() >= 2) {
+        candidate = candidate.substring(0, candidate.length() - 1) + "..";
+      } else {
+        candidate = "..";
+      }
+      display->getTextBounds(candidate.c_str(), x, baselineY, &x1, &y1, &w, &h);
+      if (w <= maxW) {
+        display->setCursor(x, baselineY);
+        display->print(candidate);
+        return;
+      }
+      t.remove(t.length() - 1);
+    }
+  };
+
+  const int16_t x = 1;
+  const uint16_t maxW = (uint16_t)(DISPLAY_WIDTH - 2);
+
   display->setTextColor(display->color565(200, 200, 200));
-  display->setCursor(2, 10);
-  display->print(line1 ? line1 : "");
+  printFit(x, 10, maxW, line1);
+
   display->setTextColor(display->color565(140, 140, 140));
-  display->setCursor(2, 20);
-  display->print(line2 ? line2 : "");
+  printFit(x, 22, maxW, line2);
 }
-
-
